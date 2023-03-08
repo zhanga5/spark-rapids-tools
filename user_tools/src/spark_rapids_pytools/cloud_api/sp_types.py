@@ -16,12 +16,14 @@
 
 import configparser
 import json
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from logging import Logger
 from typing import cast, Type, Any
 
-from spark_rapids_pytools.common.prop_manager import AbstractPropertiesContainer, JSONPropertiesContainer
+from spark_rapids_pytools.common.prop_manager import AbstractPropertiesContainer, JSONPropertiesContainer, \
+    get_elem_non_safe
 from spark_rapids_pytools.common.sys_storage import StorageDriver, FSUtil
 from spark_rapids_pytools.common.utilities import ToolLogging, SysCmd, Utils
 
@@ -75,10 +77,22 @@ class GpuDevice(EnumeratedType):
     K80 = 'k80'
     A100 = 'a100'
     P100 = 'P100'
+    P4 = 'P4'
 
     @classmethod
     def get_default_gpu(cls):
         return cls.T4
+
+    def get_gpu_mem(self) -> list:
+        memory_hash = {
+            self.T4: [16384],
+            self.A100: [40960, 81920],
+            self.P4: [8192],
+            self.K80: [12288],
+            self.V100: [16384],
+            self.P100: [16384]
+        }
+        return memory_hash.get(self)
 
 
 class ClusterState(EnumeratedType):
@@ -99,6 +113,7 @@ class ClusterState(EnumeratedType):
 
 class CloudPlatform(EnumeratedType):
     """symbolic names (members) bound to supported cloud platforms."""
+    DATABRICKS_AWS = 'databricks_aws'
     DATAPROC = 'dataproc'
     EMR = 'emr'
     LOCAL = 'local'
@@ -175,16 +190,17 @@ class ClusterNode:
     def _pull_sys_info(self, cli=None) -> SysInfo:
         raise NotImplementedError
 
-    def _construct_hw_info(self,
-                           cli=None,
-                           gpu_info: GpuHWInfo = None,
-                           sys_info: SysInfo = None):
+    def construct_hw_info(self,
+                          cli=None,
+                          gpu_info: GpuHWInfo = None,
+                          sys_info: SysInfo = None):
         del cli  # Unused cli, defined for future use.
         self.hw_info = NodeHWInfo(sys_info=sys_info,
                                   gpu_info=gpu_info)
 
     def fetch_and_set_hw_info(self, cli=None):
         self._pull_and_set_mc_props(cli)
+        sys_info = self._pull_sys_info(cli)
         try:
             # if a node has no gpu, then it is expected that setting the gpu info fails
             gpu_info = self._pull_gpu_hw_info(cli)
@@ -192,8 +208,7 @@ class ClusterNode:
             cli.logger.info(f'Could not pull GPU info for '
                             f'{SparkNodeType.tostring(self.node_type)} node {self.name}: {ex}')
             gpu_info = None
-        sys_info = self._pull_sys_info(cli)
-        self._construct_hw_info(cli=cli, gpu_info=gpu_info, sys_info=sys_info)
+        self.construct_hw_info(cli=cli, gpu_info=gpu_info, sys_info=sys_info)
 
     def find_best_cpu_conversion(self, target_list: dict):
         target_cpus = self.hw_info.sys_info.num_cpus
@@ -269,8 +284,23 @@ class CMDDriverBase:
         res = []
         cmd_runner_props = self.get_cmd_run_configs()
         if cmd_runner_props:
-            return cmd_runner_props.get('cliPiggyBackEnvVars')['definedVars']
+            res = cmd_runner_props.get('cliPiggyBackEnvVars')['definedVars']
         return res
+
+    def get_piggyback_arguments(self) -> list:
+        res = []
+        cmd_runner_props = self.get_cmd_run_configs()
+        if cmd_runner_props:
+            res = cmd_runner_props.get('cliPiggyBackArgs')['definedArgs']
+        return res
+
+    def get_rapids_job_configs(self, deploy_mode: DeployMode) -> dict:
+        cmd_runner_props = self.get_cmd_run_configs()
+        if cmd_runner_props:
+            deploy_mode_configs = get_elem_non_safe(cmd_runner_props,
+                                                    ['rapidsJobs', DeployMode.tostring(deploy_mode)])
+            return deploy_mode_configs
+        return None
 
     def get_and_set_env_vars(self):
         """For that driver, try to get all the available system environment for the system."""
@@ -330,6 +360,24 @@ class CMDDriverBase:
                                       cmd_log_str,
                                       stdout_str,
                                       stderr_str)
+
+        def is_sdk_cmd(original_cmd, cmd_prefix: str) -> bool:
+            if isinstance(original_cmd, list):
+                # the command is an array, then we should only pick the first index
+                cmd_token = original_cmd[0]
+            else:
+                cmd_token = original_cmd
+            return cmd_token.startswith(cmd_prefix)
+
+        def append_to_cmd(original_cmd, extra_args: list) -> Any:
+            if isinstance(original_cmd, list):
+                res = original_cmd[:]
+                res.extend(extra_args)
+                return res
+            extra_args_flatten = ' '.join(extra_args)
+            return f'{original_cmd} {extra_args_flatten}'
+
+        # process the env_variables of the command
         piggyback_vars = self.get_piggyback_props()
         for var_entry in piggyback_vars:
             prop_label = var_entry['confProperty']
@@ -340,6 +388,16 @@ class CMDDriverBase:
                 else:
                     # use setdefault in case the env_car was already defined
                     env_vars.setdefault(var_entry['varKey'], var_value)
+        # process the pigyybacked sdk arguments
+        piggyback_args = []
+        piggyback_args_raw = self.get_piggyback_arguments()
+        for arg_entry in piggyback_args_raw:
+            if is_sdk_cmd(cmd, arg_entry['sdkCommand']):
+                # we should apply the
+                piggyback_args.append(f'--{arg_entry["argKey"]}')
+                piggyback_args.append(f'{arg_entry["argValue"]}')
+        if piggyback_args:
+            cmd = append_to_cmd(cmd, piggyback_args)
         cmd_args = {
             'cmd': cmd,
             'fail_ok': fail_ok,
@@ -390,6 +448,52 @@ class CMDDriverBase:
                                              query_args: dict = None) -> str:
         cmd_args = self._build_platform_list_cluster(cluster=cluster, query_args=query_args)
         return self.run_sys_cmd(cmd_args)
+
+    def exec_platform_describe_accelerator(self,
+                                           accelerator_type: str,
+                                           **cmd_args) -> str:
+        """
+        Some platforms like Dataproc represent GPUs as accelerators.
+        To get the information of each accelerator, we need to run describe cmd.
+        :param accelerator_type: the name of the GPU accelerator which can be platform specific.
+        :param cmd_args: the arguments to be sent to the sdk
+        :return: a string in json format representing the information about the accelerator
+        """
+        del accelerator_type  # Unused accelerator_type
+        del cmd_args  # Unused cmd_args
+        return ''
+
+    def build_local_job_arguments(self, submit_args: dict) -> dict:
+        """
+        an implementation specific to the platform that build a dictionary to store argument and
+        sys env-vars needed for the submission of a local mode on that platform.
+        :param submit_args: the arguments specified by the user that reflects on the platform.
+        :return: a dictionary in the format of {"jvmArgs": {}, "envArgs": {}}
+        """
+        jvm_heap_size = submit_args.get('jvmMaxHeapSize')
+        xmx_key = f'Xmx{jvm_heap_size}g'
+        res = {
+            'jvmArgs': {
+                # TODO: setting the AWS access keys from jvm arguments did not work
+                # 'Dspark.hadoop.fs.s3a.secret.key': aws_access_key,
+                # 'Dspark.hadoop.fs.s3a.access.key': aws_access_id
+                xmx_key: ''
+            },
+            'envArgs': {}
+        }
+        rapids_configs = self.get_rapids_job_configs(self.cloud_ctxt.get('deployMode'))
+        if not rapids_configs:
+            return res
+        global_sys_vars = rapids_configs.get('definedVars')
+        if not global_sys_vars:
+            return res
+        env_args_table = {}
+        for sys_var in global_sys_vars:
+            prop_value = self.get_env_var(sys_var['confProperty'])
+            if prop_value:
+                env_args_table.setdefault(sys_var['varKey'], prop_value)
+        res.update({'envArgs': env_args_table})
+        return res
 
 
 @dataclass
@@ -489,40 +593,58 @@ class PlatformBase:
                                                           'confProperties',
                                                           'propertiesMap')
         if properties_map_arr:
-            prop_keys = []
+            # We support multiple CLI configurations, the following two dictionaries
+            # map config files to the corresponding property keys to be set, and section names respectively
+            config_file_keys = defaultdict(list)
+            config_file_section = {}
             for prop_elem in properties_map_arr:
                 if prop_elem.get('confProperty') in remaining_props:
-                    prop_keys.append(prop_elem.get('propKey'))
-            # TODO: we should check if the section is of pattern _PropName_,
-            #       then we extract that property and use it as  the section name
-            loaded_conf_dict = self._load_props_from_sdk_conf_file(keyList=prop_keys,
-                                                                   sectionKey=self.ctxt.get('profile'))
-            if loaded_conf_dict:
-                self.ctxt.update(loaded_conf_dict)
+                    # The property uses the default value which is '_cliConfigFile_'
+                    config_file = prop_elem.get('configFileProp', '_cliConfigFile_')
+                    config_file_keys[config_file].append(prop_elem.get('propKey'))
+                    if config_file not in config_file_section:
+                        config_file_section[config_file] = prop_elem.get('section').strip('_')
+            # The section names are loaded from dictionary 'config_file_section'
+            # Example section names are awsProfile/profile
+            for config_file in config_file_keys:
+                loaded_conf_dict = \
+                    self._load_props_from_sdk_conf_file(keyList=config_file_keys[config_file],
+                                                        configFile=config_file.strip('_'),
+                                                        sectionKey=self.ctxt.get(config_file_section[config_file]))
+                if loaded_conf_dict:
+                    self.ctxt.update(loaded_conf_dict)
             for prop_elem in properties_map_arr:
-                if prop_elem.get('propKey') not in loaded_conf_dict:
+                if loaded_conf_dict and prop_elem.get('propKey') not in loaded_conf_dict:
                     # set it using environment variable if possible
                     self._set_env_prop_from_env_var(prop_elem.get('propKey'))
 
     def _set_credential_properties(self) -> None:
-        cli_credential_file = self.ctxt.get('credentialFile')
-        if cli_credential_file is None:
-            return
         properties_map_arr = self._get_config_environment('cliConfig',
                                                           'confProperties',
                                                           'credentialsMap')
         if not properties_map_arr:
             return
-        prop_keys = []
+        # We support multiple CLI configurations, the following two dictionaries
+        # map config files to the corresponding property keys to be set, and section names respectively
+        credential_file_keys = defaultdict(list)
+        credential_file_section = {}
         for prop_elem in properties_map_arr:
-            prop_keys.append(prop_elem.get('propKey'))
-        # TODO: we should check if the section is of pattern _PropName_,
-        #       then we extract that property and use it as  the section name
-        loaded_conf_dict = self.load_from_config_parser(cli_credential_file,
-                                                        keyList=prop_keys,
-                                                        sectionKey=self.ctxt.get('profile'))
-        if loaded_conf_dict:
-            self.ctxt.update(loaded_conf_dict)
+            credential_file = prop_elem.get('configFileProp', '_credentialFile_')
+            credential_file_keys[credential_file].append(prop_elem.get('propKey'))
+            if credential_file not in credential_file_section:
+                credential_file_section[credential_file] = prop_elem.get('section').strip('_')
+        # The section names are loaded from dictionary 'config_file_section'
+        # Example section names are awsProfile/profile
+        for credential_file in credential_file_keys:
+            credential_file_value = self.ctxt.get(credential_file.strip('_'))
+            if not credential_file_value:
+                continue
+            loaded_conf_dict = \
+                self.load_from_config_parser(credential_file_value,
+                                             keyList=credential_file_keys[credential_file],
+                                             sectionKey=self.ctxt.get(credential_file_section[credential_file]))
+            if loaded_conf_dict:
+                self.ctxt.update(loaded_conf_dict)
 
     def _parse_arguments(self, ctxt_args: dict):
         # Get the possible parameters for that platform.
@@ -541,7 +663,10 @@ class PlatformBase:
         self._set_credential_properties()
 
     def _load_props_from_sdk_conf_file(self, **prop_args) -> dict:
-        cli_conf_file = self.ctxt.get('cliConfigFile')
+        if prop_args.get('configFile'):
+            cli_conf_file = self.ctxt.get(prop_args.get('configFile'))
+        else:
+            cli_conf_file = self.ctxt.get('cliConfigFile')
         if cli_conf_file is None:
             return None
         return self.load_from_config_parser(cli_conf_file, **prop_args)
@@ -639,6 +764,7 @@ class ClusterBase:
     state: ClusterState = field(default=ClusterState.RUNNING, init=False)
     nodes: dict = field(default_factory=dict, init=False)
     props: AbstractPropertiesContainer = field(default=None, init=False)
+    logger: Logger = field(default=ToolLogging.get_and_setup_logger('rapids.tools.cluster'), init=False)
 
     def __post_init__(self):
         self.cli = self.platform.cli
@@ -646,8 +772,16 @@ class ClusterBase:
 
     def _init_connection(self, cluster_id: str = None,
                          props: str = None) -> dict:
-        del props, cluster_id  # Unused by super method.
-        return {}
+        name = cluster_id
+        if props is None:
+            # we need to pull the properties from the platform
+            props = self.cli.pull_cluster_props_by_args(args={'cluster': name, 'region': self.region})
+        cluster_props = JSONPropertiesContainer(props, file_load=False)
+        cluster_args = {
+            'name': name,
+            'props': cluster_props
+        }
+        return cluster_args
 
     def set_fields_from_dict(self, field_values: dict = None):
         """
@@ -729,9 +863,45 @@ class ClusterBase:
     def get_worker_node(self, ind: int = 0) -> ClusterNode:
         return self.nodes.get(SparkNodeType.WORKER)[ind]
 
+    def _build_migrated_cluster(self, orig_cluster):
+        """
+        specific to the platform on how to build a cluster based on migration
+        :param orig_cluster:
+        """
+        raise NotImplementedError
+
+    def migrate_from_cluster(self, orig_cluster):
+        self.name = orig_cluster.name
+        self.uuid = orig_cluster.uuid
+        self.zone = orig_cluster.zone
+        self.state = orig_cluster.state
+        self._build_migrated_cluster(orig_cluster)
+
+    def find_matches_for_node(self) -> (dict, dict):
+        """
+        Maps the CPU instance types to GPU types
+        :return: a map converting CPU machines to GPU ones and a map
+                containing the supported GPUs.
+        """
+        mc_map = {}
+        supported_gpus = self.platform.get_supported_gpus()
+        for spark_node_type, node_list in self.nodes.items():
+            if spark_node_type == SparkNodeType.MASTER:
+                # skip
+                self.cli.logger.debug('Skip converting Master nodes')
+            else:
+                for anode in node_list:
+                    if anode.instance_type in supported_gpus:
+                        continue
+                    if anode.instance_type not in mc_map:
+                        best_mc_match = anode.find_best_cpu_conversion(supported_gpus)
+                        mc_map.update({anode.instance_type: best_mc_match})
+        return mc_map, supported_gpus
+
 
 def get_platform(platform_id: Enum) -> Type[PlatformBase]:
     platform_hash = {
+        CloudPlatform.DATABRICKS_AWS: ('spark_rapids_pytools.cloud_api.databricks_aws', 'DBAWSPlatform'),
         CloudPlatform.DATAPROC: ('spark_rapids_pytools.cloud_api.dataproc', 'DataprocPlatform'),
         CloudPlatform.EMR: ('spark_rapids_pytools.cloud_api.emr', 'EMRPlatform'),
     }
