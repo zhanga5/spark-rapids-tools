@@ -23,7 +23,7 @@
     <artifactId>rapids-4-spark-tools_2.12</artifactId>
     <name>RAPIDS Accelerator for Apache Spark tools</name>
     <description>RAPIDS Accelerator for Apache Spark tools</description>
-    <version>11.22.35</version>
+    <version>11.22.36</version>
     <packaging>jar</packaging>
     <url>http://github.com/NVIDIA/spark-rapids-tools</url>
 
